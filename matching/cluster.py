@@ -1,110 +1,171 @@
+# matching/cluster.py
+import time
+import re
 import pandas as pd
 import networkx as nx
 from rapidfuzz import fuzz
-import time
 
-def cluster_people(df_norm):
+# --------- helpers ---------
+_ALNUM = re.compile(r"[^a-z0-9]+")
+
+def _alnum(s: str) -> str:
+    return _ALNUM.sub("", str(s).strip().lower())
+
+# --------- PEOPLE ---------
+def cluster_people(df_norm: pd.DataFrame):
+    """
+    1) Exact pre-cluster by email (when present)
+    2) Fuzzy by (first_name, last_name) within tight blocks (LN initial + FN initial)
+       - require >=3 alnum chars in both names for fuzzy
+       - threshold tuned to 88 to reduce chain merges
+    Returns: (clusters: list[set[int]], df_with_cluster_id)
+    """
     start = time.time()
-    cluster_map = {}
-    cluster_id = 0
+    df = df_norm.copy()
 
-    # Cluster by exact email first (fast)
-    email_groups = df_norm.groupby('email')
-    for email, group in email_groups:
-        if pd.isna(email) or email == '':
-            continue
-        indices = group.index.tolist()
-        for idx in indices:
-            cluster_map[idx] = cluster_id
-        cluster_id += 1
+    # Ensure helpers exist
+    for col in ["first_name", "last_name", "email"]:
+        if col not in df.columns:
+            df[col] = ""
+    if "first_name_alnum" not in df.columns:
+        df["first_name_alnum"] = df["first_name"].apply(_alnum)
+    if "last_name_alnum" not in df.columns:
+        df["last_name_alnum"] = df["last_name"].apply(_alnum)
 
-    # Handle remaining records without email
-    remaining_indices = [idx for idx in df_norm.index if idx not in cluster_map]
+    cluster_map: dict[int, int] = {}
+    next_cid = 0
 
-    # Fuzzy matching on remaining records by (first_name + last_name)
-    # To keep it reasonable, use blocking on first letter of last_name
-    name_blocks = {}
-    for idx in remaining_indices:
-        last_name = df_norm.at[idx, 'last_name']
-        if pd.isna(last_name) or last_name == '':
-            block_key = ''
-        else:
-            block_key = last_name[0].lower()
-        name_blocks.setdefault(block_key, []).append(idx)
+    # 1) Exact by email
+    if "email" in df.columns:
+        for em, grp in df.groupby(df["email"].where(df["email"] != "", None), dropna=True):
+            for idx in grp.index:
+                cluster_map[idx] = next_cid
+            next_cid += 1
 
-    # Use NetworkX to cluster by fuzzy matching
+    # 2) Fuzzy by name for remaining
+    remaining = [i for i in df.index if i not in cluster_map]
+
+    # Block by LN initial + FN initial (tight)
+    blocks: dict[str, list[int]] = {}
+    for i in remaining:
+        ln = df.at[i, "last_name_alnum"][:1] if isinstance(df.at[i, "last_name_alnum"], str) else ""
+        fn = df.at[i, "first_name_alnum"][:1] if isinstance(df.at[i, "first_name_alnum"], str) else ""
+        key = f"{ln}{fn}"  # e.g., 'sd' for Smith, Daniel
+        blocks.setdefault(key, []).append(i)
+
     G = nx.Graph()
+    for idxs in blocks.values():
+        for i in idxs:
+            G.add_node(i)
+        for a, i in enumerate(idxs):
+            f1 = df.at[i, "first_name"]
+            l1 = df.at[i, "last_name"]
+            if len(_alnum(f1)) < 3 or len(_alnum(l1)) < 3:
+                continue  # ignore too-short tokens
+            for j in idxs[a+1:]:
+                f2 = df.at[j, "first_name"]
+                l2 = df.at[j, "last_name"]
+                if len(_alnum(f2)) < 3 or len(_alnum(l2)) < 3:
+                    continue
+                # average of first & last name similarity
+                s_fn = fuzz.token_sort_ratio(f1.lower(), f2.lower())
+                s_ln = fuzz.token_sort_ratio(l1.lower(), l2.lower())
+                if (s_fn + s_ln) / 2 >= 88:
+                    G.add_edge(i, j)
 
-    for block_key, indices in name_blocks.items():
-        for i, idx1 in enumerate(indices):
-            G.add_node(idx1)
-            for idx2 in indices[i+1:]:
-                # Compute combined fuzzy score on first + last name
-                score_fn = fuzz.token_sort_ratio(str(df_norm.at[idx1, 'first_name']), str(df_norm.at[idx2, 'first_name']))
-                score_ln = fuzz.token_sort_ratio(str(df_norm.at[idx1, 'last_name']), str(df_norm.at[idx2, 'last_name']))
-                # Threshold can be tuned
-                if (score_fn + score_ln) / 2 >= 85:
-                    G.add_edge(idx1, idx2)
+    for comp in nx.connected_components(G):
+        cid = next_cid
+        for node in comp:
+            cluster_map[node] = cid
+        next_cid += 1
 
-    # Assign cluster IDs to previously unmatched records
-    for component in nx.connected_components(G):
-        # If any node already in cluster_map, assign all to that cluster
-        existing_clusters = {cluster_map[n] for n in component if n in cluster_map}
-        if existing_clusters:
-            assigned_cluster = existing_clusters.pop()
-        else:
-            assigned_cluster = cluster_id
-            cluster_id += 1
-        for node in component:
-            cluster_map[node] = assigned_cluster
+    # Singletons
+    for i in remaining:
+        if i not in cluster_map:
+            cluster_map[i] = next_cid
+            next_cid += 1
 
-    # Assign cluster_id to DataFrame
-    df_norm['cluster_id'] = df_norm.index.map(lambda x: cluster_map.get(x, -1))
+    df["cluster_id"] = df.index.map(cluster_map.get)
 
-    # Build clusters list
+    # Build cluster sets
     clusters = []
-    unique_cluster_ids = set(cluster_map.values())
-    for cid in unique_cluster_ids:
-        members = {idx for idx, clid in cluster_map.items() if clid == cid}
-        clusters.append(members)
+    for cid in sorted(set(cluster_map.values())):
+        clusters.append({i for i, c in cluster_map.items() if c == cid})
 
-    print(f"[cluster_people] Total clustering time: {time.time() - start:.2f}s, clusters found: {len(clusters)}")
-    return clusters, df_norm
+    print(f"[cluster_people] time: {time.time()-start:.2f}s, clusters: {len(clusters)}")
+    return clusters, df
 
-def cluster_accounts(df):
+# --------- ACCOUNTS ---------
+def cluster_accounts(df: pd.DataFrame):
+    """
+    1) Exact pre-cluster by website_domain (when present)
+    2) Fuzzy by account_name within 2-char alnum blocks
+       - ignore names with <3 alnum chars for fuzzy
+       - threshold 90 to prevent chain merges
+    Returns: (clusters: list[set[int]], df_with_cluster_id)
+    """
     start = time.time()
+    dfa = df.copy()
+
+    if "account_name" not in dfa.columns:
+        raise KeyError("Expected 'account_name' in accounts dataframe.")
+    if "website_domain" not in dfa.columns:
+        dfa["website_domain"] = ""
+    if "account_name_alnum" not in dfa.columns:
+        dfa["account_name_alnum"] = dfa["account_name"].apply(_alnum)
+
+    cluster_map: dict[int, int] = {}
+    next_cid = 0
+
+    # 1) Exact by website domain
+    if dfa["website_domain"].str.len().gt(0).any():
+        for dom, grp in dfa.groupby(dfa["website_domain"].where(dfa["website_domain"] != "", None), dropna=True):
+            for idx in grp.index:
+                cluster_map[idx] = next_cid
+            next_cid += 1
+
+    # 2) Fuzzy by name within small blocks
+    remaining = [i for i in dfa.index if i not in cluster_map]
+
+    blocks: dict[str, list[int]] = {}
+    for i in remaining:
+        key = dfa.at[i, "account_name_alnum"][:2] if isinstance(dfa.at[i, "account_name_alnum"], str) else ""
+        blocks.setdefault(key, []).append(i)
+
     G = nx.Graph()
+    for idxs in blocks.values():
+        for i in idxs:
+            G.add_node(i)
+        for a, i in enumerate(idxs):
+            n1 = str(dfa.at[i, "account_name"]).strip()
+            a1 = dfa.at[i, "account_name_alnum"]
+            if len(a1) < 3:
+                continue
+            for j in idxs[a+1:]:
+                n2 = str(dfa.at[j, "account_name"]).strip()
+                a2 = dfa.at[j, "account_name_alnum"]
+                if len(a2) < 3:
+                    continue
+                score = fuzz.token_sort_ratio(n1.lower(), n2.lower())
+                if score >= 90:
+                    G.add_edge(i, j)
 
-    # Blocking by first letter of account_name for speed
-    blocks = {}
-    for i, name in enumerate(df['account_name']):
-        if pd.isna(name) or name == '':
-            block_key = ''
-        else:
-            block_key = name[0].lower()
-        blocks.setdefault(block_key, []).append(i)
-        G.add_node(i)
+    for comp in nx.connected_components(G):
+        cid = next_cid
+        for node in comp:
+            cluster_map[node] = cid
+        next_cid += 1
 
-    # Compare only within blocks (drastically reduce O(n^2))
-    for block_key, indices in blocks.items():
-        for i, idx1 in enumerate(indices):
-            name1 = str(df.at[idx1, 'account_name'])
-            for idx2 in indices[i+1:]:
-                name2 = str(df.at[idx2, 'account_name'])
-                ratio = fuzz.token_sort_ratio(name1, name2)
-                if ratio > 85:
-                    G.add_edge(idx1, idx2)
+    for i in remaining:
+        if i not in cluster_map:
+            cluster_map[i] = next_cid
+            next_cid += 1
 
-    clusters = list(nx.connected_components(G))
+    dfa["cluster_id"] = dfa.index.map(cluster_map.get)
 
-    # Annotate each record with cluster ID
-    cluster_labels = [-1] * len(df)
-    for cluster_id, cluster in enumerate(clusters):
-        for idx in cluster:
-            cluster_labels[idx] = cluster_id
+    clusters = []
+    for cid in sorted(set(cluster_map.values())):
+        clusters.append({i for i, c in cluster_map.items() if c == cid})
 
-    df_with_clusters = df.copy()
-    df_with_clusters["cluster_id"] = cluster_labels
-
-    print(f"[cluster_accounts] Total clustering time: {time.time() - start:.2f}s, clusters found: {len(clusters)}")
-    return clusters, df_with_clusters
+    print(f"[cluster_accounts] time: {time.time()-start:.2f}s, clusters: {len(clusters)}")
+    return clusters, dfa
