@@ -1,0 +1,11 @@
+@"
+.venv/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+Thumbs.db
+.streamlit/secrets.toml
+"@ | Out-File -Encoding utf8 .gitignore
